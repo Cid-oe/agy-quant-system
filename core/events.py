@@ -1,6 +1,6 @@
-import inspect
 import asyncio
 import time
+import inspect
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List
 from core.logging import SystemLogger
@@ -11,6 +11,7 @@ class SystemEvent:
     topic: str
     payload: Any
     timestamp: float = field(default_factory=time.time)
+    event_id: str = field(default_factory=lambda: str(time.time_ns()))  # T19/T20 Fix
 
 
 EventHandler = Callable[[SystemEvent], None]
@@ -38,6 +39,8 @@ class EventBus:
         self._logger.info("bus_subscribed", topic=topic, handler=handler.__name__)
 
     async def publish(self, event: SystemEvent, block: bool = True) -> bool:
+        if not event.timestamp:
+            event.timestamp = time.time()
         try:
             if block:
                 await self._queue.put(event)
