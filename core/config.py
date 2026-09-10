@@ -1,22 +1,20 @@
 import os
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from typing import List, Dict, Any
 
 @dataclass
 class SystemConfig:
-    environment: str
-    log_level: str
-    db_uri: str
-    plugins: List[str]
-    custom: Dict[str, Any]
+    environment: str = "paper"      # Default: paper. Never production without explicit config.
+    log_level: str = "INFO"
+    db_uri: str = "sqlite:///:memory:"
+    plugins: List[str] = field(default_factory=list)
+    custom: Dict[str, Any] = field(default_factory=dict)
 
 class ConfigLoader:
     @staticmethod
     def load(path: str = "config.json") -> SystemConfig:
-        return SystemConfig(
-            environment=os.getenv("AGY_ENV", "production"),
-            log_level=os.getenv("AGY_LOG_LEVEL", "INFO"),
-            db_uri=os.getenv("AGY_DB_URI", "sqlite:///:memory:"),
-            plugins=["plugins.slack_notifier"],
-            custom={"max_queue_size": 10000}
-        )
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                return SystemConfig(**json.load(f))
+        return SystemConfig()

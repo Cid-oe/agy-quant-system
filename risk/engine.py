@@ -1,57 +1,103 @@
-import asyncio
-from typing import Dict
-from core.events import SystemEvent, EventBus
+from typing import Any
+from core.logging import SystemLogger
+
 
 class RiskPolicyEngine:
-    """The ultimate gatekeeper for all outgoing orders."""
-    def __init__(self, bus: EventBus):
-        self.bus = bus
-        
-        # Hardcoded Safety Limits
-        self.MAX_ORDER_VALUE_USD = 50_000.0
-        self.MAX_TOTAL_EXPOSURE_USD = 200_000.0
-        self.MAX_DAILY_DRAWDOWN_PCT = 0.05  # 5%
-        
-        # Independent State Ledger
-        self.current_exposure: Dict[str, float] = {}
-        self.peak_equity = 1_000_000.0
-        self.current_equity = 1_000_000.0
-        
-        self.bus.subscribe("execution.raw_order_request", self.evaluate_order)
-        self.bus.subscribe("broker.portfolio_update", self._update_internal_state)
+    """
+    Synchronous, inline risk gate. Default Deny until sync_baseline() is called.
+    ALL orders MUST call evaluate() and receive True before reaching the broker.
+    No EventBus dependency — operates in-line in the caller's task.
+    """
+    def __init__(self, logger: SystemLogger):
+        self.logger = logger
+        self.MAX_ORDER_VALUE_USD   = 50_000.0
+        self.MAX_NET_EXPOSURE_USD  = 200_000.0
+        self.MAX_GROSS_EXPOSURE_USD = 400_000.0   # 2x net cap covers both legs
+        self.MAX_DAILY_DRAWDOWN_PCT = 0.05
 
-    async def evaluate_order(self, event: SystemEvent):
-        order = event.payload
-        order_value = order.price * order.quantity
-        
-        if order_value > self.MAX_ORDER_VALUE_USD:
-            await self._reject(order, f"Fat Finger: Value {order_value} exceeds {self.MAX_ORDER_VALUE_USD}")
-            return
-            
-        current_asset_exposure = self.current_exposure.get(order.symbol, 0.0)
-        if order.side == "BUY" and (current_asset_exposure + order_value) > self.MAX_TOTAL_EXPOSURE_USD:
-            await self._reject(order, f"Exposure Cap: Cannot add {order_value} to {current_asset_exposure}")
-            return
-            
-        drawdown = (self.peak_equity - self.current_equity) / self.peak_equity
-        if drawdown > self.MAX_DAILY_DRAWDOWN_PCT:
-            await self._trigger_global_halt(f"Circuit Breaker: {drawdown*100}% drawdown exceeds limit.")
-            return
+        self.net_exposure   = 0.0
+        self.gross_exposure = 0.0
+        self.peak_equity    = 0.0
+        self.current_equity = 0.0
+        self.halted = True   # Default Deny until REST baseline confirmed
 
-        approved_event = SystemEvent(topic="risk.approved_order", payload=order)
-        await self.bus.publish(approved_event)
+    def sync_baseline(self, equity: float):
+        """Must be called with live exchange REST balance before any trading starts."""
+        if equity <= 0:
+            raise ValueError("Baseline equity must be positive.")
+        self.peak_equity    = equity
+        self.current_equity = equity
+        self.halted = False
+        self.logger.info("risk_engine_synced", equity=equity)
 
-    async def _reject(self, order, reason: str):
-        rejection_event = SystemEvent(topic="risk.rejected_order", payload={"id": order.id, "reason": reason})
-        await self.bus.publish(rejection_event)
+    def evaluate(self, order: Any) -> bool:
+        """
+        Synchronous gate. Returns True only if all checks pass.
+        Any exception, missing field, or limit breach → False (Default Deny).
+        """
+        if self.halted:
+            self.logger.error("risk_reject_halted", Exception("Engine is halted"), id=getattr(order, 'id', '?'))
+            return False
 
-    async def _update_internal_state(self, event: SystemEvent):
-        portfolio = event.payload
-        self.current_equity = portfolio.total_equity
-        self.current_exposure = portfolio.asset_exposures
-        if self.current_equity > self.peak_equity:
-            self.peak_equity = self.current_equity
+        try:
+            price    = float(getattr(order, 'price',    0.0))
+            quantity = float(getattr(order, 'quantity', 0.0))
+            side     = str(getattr(order,   'side',     ''))
 
-    async def _trigger_global_halt(self, reason: str):
-        halt_event = SystemEvent(topic="system.emergency_halt", payload={"reason": reason})
-        await self.bus.publish(halt_event)
+            order_value = price * quantity
+            if order_value <= 0:
+                self.logger.error("risk_reject_zero_value", Exception("price*qty<=0"), id=getattr(order, 'id', '?'))
+                return False
+
+            if order_value > self.MAX_ORDER_VALUE_USD:
+                self.logger.error("risk_reject_fat_finger", Exception("Exceeds max order value"), value=order_value)
+                return False
+
+            delta    = order_value if side == "BUY" else -order_value
+            new_net  = self.net_exposure  + delta
+            new_gross = self.gross_exposure + order_value
+
+            if abs(new_net) > self.MAX_NET_EXPOSURE_USD:
+                self.logger.error("risk_reject_net_exposure", Exception("Net cap breach"), new_net=new_net)
+                return False
+
+            if new_gross > self.MAX_GROSS_EXPOSURE_USD:
+                self.logger.error("risk_reject_gross_exposure", Exception("Gross cap breach"), new_gross=new_gross)
+                return False
+
+            # All checks passed — atomically reserve exposure
+            self.net_exposure   = new_net
+            self.gross_exposure = new_gross
+            return True
+
+        except Exception as e:
+            self.logger.error("risk_reject_exception", e)
+            return False
+
+    def settle(self, order: Any, filled_value: float):
+        """Call after confirmed broker fill to reconcile the ledger."""
+        side  = str(getattr(order, 'side', ''))
+        delta = filled_value if side == "BUY" else -filled_value
+        self.net_exposure   += delta
+        self.gross_exposure += filled_value
+
+    def update_portfolio(self, equity: float):
+        """
+        Called on every portfolio update event.
+        Latching halt: once tripped, only an explicit operator reset clears it.
+        """
+        self.current_equity = equity
+        if equity > self.peak_equity:
+            self.peak_equity = equity
+
+        if self.peak_equity > 0:
+            drawdown = (self.peak_equity - self.current_equity) / self.peak_equity
+            if drawdown > self.MAX_DAILY_DRAWDOWN_PCT and not self.halted:
+                self.halted = True
+                self.logger.error("circuit_breaker_halt",
+                                  Exception(f"Drawdown {drawdown:.2%} breached {self.MAX_DAILY_DRAWDOWN_PCT:.2%}"))
+
+    def operator_reset_halt(self):
+        """Explicit operator action required to re-enable after a halt. Never automated."""
+        self.halted = False
+        self.logger.info("risk_halt_manually_cleared")
